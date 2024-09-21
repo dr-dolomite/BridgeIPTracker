@@ -5,11 +5,19 @@ STATUS_FILE="/tmp/wan_status.txt"
 CHECK_INTERVAL=30
 RETRY_INTERVAL=60
 MAX_DOWN_CHECKS=5
-RESTART_WAN6_SCRIPT="/personal_script/restart_wan6.sh"
-RESTART_WAN6_RUN=false
+MAX_RESTARTS=5          # Maximum restarts before increasing interval
+LONG_RETRY_INTERVAL=900 # 15 minutes
+
+# Initialize the restart counter
+restart_counter=0
 
 # Wait for the router to fully boot up
 sleep 15
+
+# Create a cron job to delete the log file every 3 days at 3:00 AM
+if ! grep -q "$LOG_FILE" /etc/crontabs/root; then
+    echo "0 3 */3 * * rm $LOG_FILE" >>/etc/crontabs/root
+fi
 
 # Function to log messages with a timestamp
 log() {
@@ -18,7 +26,12 @@ log() {
 
 # Function to get the WAN status from ifstatus
 get_wan_status() {
-    ifstatus wan >"$STATUS_FILE"
+    ifstatus wan >"$STATUS_FILE" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        log "Failed to get WAN status."
+        return 1
+    fi
+
     # Check if the interface is up
     local up=$(grep '"up":' "$STATUS_FILE" | awk '{print $2}' | tr -d ',')
     echo $up
@@ -27,15 +40,13 @@ get_wan_status() {
 # Function to get the current IP address of the wan interface using ifstatus
 get_wan_ip() {
     local up_status=$(get_wan_status)
-    log "Up status: $up_status"
-
-    if [ "$up_status" = "false" ]; then
-        log "WAN interface is down when checking IP."
+    if [ $? -ne 0 ] || [ "$up_status" = "false" ]; then
+        log "WAN interface is down or failed to retrieve status."
         return 1
     fi
 
     # Extract the IP address from the status file
-    grep '"address"' "$STATUS_FILE" | awk -F'"' '{print $4}'
+    grep '"address"' "$STATUS_FILE" | awk -F'"' '{print $4}' 2>/dev/null
 }
 
 # Function to check if the IP is in the 192.168.*.* range
@@ -49,34 +60,29 @@ is_ip_in_range() {
 
 # Function to restart the specified interface
 restart_interface() {
-    local interface=$1
-    log "Restarting $interface interface."
-    ifdown $interface
-    sleep 3
-    ifup $interface
-}
-
-# Function to run the restart_wan6.sh script
-run_restart_wan6() {
-    if [ "$RESTART_WAN6_RUN" = false ]; then
-        log "WAN IP address initiated properly. Running $RESTART_WAN6_SCRIPT."
-        sh "$RESTART_WAN6_SCRIPT"
-        RESTART_WAN6_RUN=true
-    fi
+    log "Restarting WAN interface."
+    ifconfig eth1 down
+    sleep 5
+    ifconfig eth1 up
 }
 
 log "Script started."
 down_checks=0
 
 while true; do
-    # Get the WAN status
     up_status=$(get_wan_status)
+    if [ $? -ne 0 ]; then
+        log "Failed to get WAN status. Sleeping before retry."
+        sleep $RETRY_INTERVAL
+        continue
+    fi
 
     log "Checking WAN interface status."
     log "WAN interface status: $up_status"
 
     if [ "$up_status" = "false" ]; then
-        log "WAN interface is down. Check count: $((++down_checks))"
+        log "WAN interface is down. Check count: $((down_checks + 1))"
+        down_checks=$((down_checks + 1))
         if [ $down_checks -ge $MAX_DOWN_CHECKS ]; then
             log "WAN has been down for $MAX_DOWN_CHECKS checks. Exiting script."
             exit 1
@@ -86,73 +92,77 @@ while true; do
     else
         down_checks=0
 
-        # Get the current IP of the wan interface
         current_ip=$(get_wan_ip)
-
-        log "Checking current IP."
-
-        if [ $? -eq 1 ]; then
+        if [ $? -ne 0 ]; then
             log "Error getting WAN IP. Exiting."
             exit 1
         fi
 
-        # Check if the IP is in the 192.168.*.* range
+        log "Checking current IP."
+
         if is_ip_in_range "$current_ip"; then
-            log "IP $current_ip is in the range 192.168.*.*, which is good."
+            log "IP $current_ip is in the range 192.168.*.*."
+            log "Private IP detected."
 
-            # Restart the wan interface
-            log "Restarting WAN interface."
+            # Increment restart counter
+            restart_counter=$((restart_counter + 1))
+            log "Restart counter: $restart_counter"
 
-            restart_interface "wan"
+            # Restart WAN interface
+            restart_interface
 
             log "WAN interface restarted, waiting for IP to potentially change."
 
-            # Wait a bit for the IP to potentially change
             sleep 10
 
-            # Check the new IP address
             new_ip=$(get_wan_ip)
-
-            if [ $? -eq 1 ]; then
+            if [ $? -ne 0 ]; then
                 log "WAN interface is down after restart. Exiting."
                 exit 1
             fi
 
-            log "New IP after restart: $new_ip"
-
-            if [ "$new_ip" != "$current_ip" ]; then
-                log "IP changed to $new_ip, continuing monitoring."
+            if [ "$restart_counter" -ge $MAX_RESTARTS ]; then
+                log "Reached maximum restarts ($MAX_RESTARTS). Increasing retry interval to 15 minutes."
+                sleep $LONG_RETRY_INTERVAL
             else
-                log "IP did not change, still $new_ip. Sleeping for $RETRY_INTERVAL seconds."
+                log "Sleeping for $RETRY_INTERVAL seconds."
                 sleep $RETRY_INTERVAL
             fi
 
         else
             log "IP $current_ip is a public IP."
-            # Run the restart_wan6.sh script if the IP is good
-            run_restart_wan6
 
-            # Loop to detect internet access
             while true; do
-                # Check if the internet is accessible
                 log "Checking internet access."
-                ping -c 5 9.9.9.9 >/dev/null 2>&1
 
-                # Check if the ping was unsuccessful
-                if [ $? -ne 0 ]; then
-                    log "Internet is not accessible."
-                    log "Checking IP again."
-                    # Proceed to main loop
-                    break
-                else
-                    log "Internet is accessible."
-                fi
+                failed_ping_count=0
 
-                sleep 15
+                while [ $failed_ping_count -lt 5 ]; do
+                    ping -c 5 -I eth1 9.9.9.9 >/dev/null
+                    if [ $? -ne 0 ]; then
+                        failed_ping_count=$((failed_ping_count + 1))
+                        log "Ping failed ($failed_ping_count/5)."
+                    else
+                        log "Internet is accessible."
+                        restart_counter=0   # Reset restart counter on successful internet access
+                        failed_ping_count=0 # Reset failed ping counter
+                        break
+                    fi
+
+                    if [ $failed_ping_count -ge 5 ]; then
+                        log "Internet is not accessible after 5 failed pings."
+                        log "Checking IP again."
+                        break
+                    fi
+
+                    sleep $CHECK_INTERVAL
+                done
+
+                sleep $CHECK_INTERVAL
             done
+
         fi
     fi
 
-    # Sleep for the check interval before checking again
     sleep $CHECK_INTERVAL
 done
